@@ -33,6 +33,8 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -518,26 +520,32 @@ class TokenManagerCodeGenerator implements org.javacc.parser.TokenManagerCodeGen
         jcb.println(staticString + "void TokenLexicalActions(Token matchedToken) {");
         jcb.println("  // TOKEN lexical actions");
         //    dumpLexicalActions(jcb, allMatches, TokenizerData.MatchType.TOKEN, "matchedToken.kind");
-        dumpLexicalActions(jcb, allMatches, TokenizerData.MatchType.TOKEN, "jjmatchedKind");
+        dumpLexicalActions(jcb, allMatches, "jjmatchedKind", TokenizerData.MatchType.TOKEN);
         jcb.println("  }");
         jcb.println();
 
         // Skip actions.
-        // TODO(sreeni) : Streamline this mess.
+        // The generated TokenManagerDriver routes both SKIP and SPECIAL_TOKEN matches through
+        // SkipLexicalActions(), so this switch must carry the cases of both match types.
         jcb.println(staticString + "void SkipLexicalActions(Token matchedToken) {");
-        jcb.println("  // SKIP lexical actions");
-        dumpLexicalActions(jcb, allMatches, TokenizerData.MatchType.SKIP, "jjmatchedKind");
-        //    jcb.println("  // SPECIAL_TOKEN lexical actions");
-        //    dumpLexicalActions(jcb, allMatches, TokenizerData.MatchType.SPECIAL_TOKEN,
-        // "jjmatchedKind");
+        jcb.println("  // SKIP and SPECIAL_TOKEN lexical actions");
+        dumpLexicalActions(
+            jcb,
+            allMatches,
+            "jjmatchedKind",
+            TokenizerData.MatchType.SKIP,
+            TokenizerData.MatchType.SPECIAL_TOKEN
+        );
         jcb.println("  }");
         jcb.println();
 
         // More actions.
+        // Every MORE match extends the pending image, whether or not it carries an action, so the
+        // accumulator is advanced for all of them before the switch.
         jcb.println(staticString + "void MoreLexicalActions() {");
-        //    jcb.println("    jjimageLen += (lengthOfMatch = jjmatchedPos + 1);");
+        jcb.println("    jjimageLen += (lengthOfMatch = jjmatchedPos + 1);");
         jcb.println("  // MORE lexical actions");
-        dumpLexicalActions(jcb, allMatches, TokenizerData.MatchType.MORE, "jjmatchedKind");
+        dumpLexicalActions(jcb, allMatches, "jjmatchedKind", TokenizerData.MatchType.MORE);
         jcb.println("  }");
         jcb.println();
     }
@@ -545,23 +553,29 @@ class TokenManagerCodeGenerator implements org.javacc.parser.TokenManagerCodeGen
     private static void dumpLexicalActions(
         final JavaCodeBuilder jcb,
         final Map<Integer, TokenizerData.MatchInfo> allMatches,
-        final TokenizerData.MatchType matchType,
-        final String kindString
+        final String kindString,
+        final TokenizerData.MatchType... matchTypes
     ) {
+        final EnumSet<TokenizerData.MatchType> wanted = EnumSet.noneOf(TokenizerData.MatchType.class);
+        Collections.addAll(wanted, matchTypes);
+
         jcb.println("    switch (" + kindString + ") {");
         for (final int i : allMatches.keySet()) {
             final TokenizerData.MatchInfo matchInfo = allMatches.get(i);
-            if ((matchInfo.action == null) || (matchInfo.matchType != matchType)) {
+            if ((matchInfo.action == null) || !wanted.contains(matchInfo.matchType)) {
                 continue;
             }
             jcb.println("      case " + i + ": {");
             // TODO check (MMa start added) comes from v7 output cf. JSqlParser
             if (matchInfo.matchType == MatchType.SKIP) {
             } else if (matchInfo.matchType == MatchType.MORE) {
-                jcb.println("        jjimageLen += (lengthOfMatch = jjmatchedPos);");
-            } else if (matchInfo.matchType == MatchType.TOKEN) {
+                // jjimageLen was already advanced by MoreLexicalActions() for this match.
+                jcb.println("        image.append(input_stream.GetSuffix(jjimageLen));");
+                jcb.println("        jjimageLen = 0;");
+            } else if ((matchInfo.matchType == MatchType.TOKEN)
+                || (matchInfo.matchType == MatchType.SPECIAL_TOKEN)) {
                 jcb.println(
-                    "        image.append(input_stream.GetSuffix(jjimageLen + (lengthOfMatch = jjmatchedPos)));"
+                    "        image.append(input_stream.GetSuffix(jjimageLen + (lengthOfMatch = jjmatchedPos + 1)));"
                 );
             }
             // TODO check (MMa end added)
