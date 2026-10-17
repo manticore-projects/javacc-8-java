@@ -118,6 +118,22 @@ class ParserCodeGenerator implements org.javacc.parser.ParserCodeGenerator {
   private static final int CHOICE_CHAIN_THRESHOLD = 1000;
 
   /**
+   * Minimum number of alternatives for a lookahead choice of single tokens to be scanned with one
+   * bit set lookup rather than one {@code jj_scan_token} call per alternative.
+   */
+  private static final int TOKEN_SET_CHOICE_THRESHOLD = 4;
+
+  /**
+   * Maximum number of alternatives of a token set choice, keeping the methods that build its arrays
+   * of kinds and locations (about 7 bytes of bytecode per alternative) within the 64KB limit.
+   */
+  private static final int TOKEN_SET_CHOICE_MAX = 5000;
+
+  /** The token kinds, and the locations of their alternatives, of the token set choices so far. */
+  private final List<int[]> tokenSetKinds = new ArrayList<>();
+  private final List<String[]> tokenSetLocations = new ArrayList<>();
+
+  /**
    * To be set to true to add debug comment tags in the generated code (to ease linking it with this
    * generator), false otherwise (which should be the normal case).
    */
@@ -1626,6 +1642,143 @@ class ParserCodeGenerator implements org.javacc.parser.ParserCodeGenerator {
       cb.println();
     }
     deferredChoiceChunks.clear();
+
+    emitTokenSetChoices();
+  }
+
+  /**
+   * The token scanned by each alternative of {@code choice} when every alternative scans a single
+   * token without semantic lookahead, and there are enough of them to be worth a bit set; null
+   * otherwise. These alternatives are the ones {@link #generate3R} names {@code jj_scan_token}.
+   */
+  private List<RegularExpression> singleTokenAlternatives(final Choice choice) {
+    final int nbChoices = choice.getChoices().size();
+    if (nbChoices < TOKEN_SET_CHOICE_THRESHOLD || nbChoices > TOKEN_SET_CHOICE_MAX
+        || Options.getDebugLookahead()) {
+      return null;
+    }
+    final List<RegularExpression> tokens = new ArrayList<>(nbChoices);
+    for (final Expansion alternative : choice.getChoices()) {
+      final Lookahead lookahead = (Lookahead) ((Sequence) alternative).units.get(0);
+      final String name = internalNames.get(alternative);
+      if (lookahead.getActionTokens().size() != 0 || name == null
+          || !name.startsWith("jj_scan_token")) {
+        return null;
+      }
+      final RegularExpression token = scannedToken(alternative);
+      if (token == null) {
+        return null;
+      }
+      tokens.add(token);
+    }
+    return tokens;
+  }
+
+  /** The token {@link #generate3R} found at the end of the unwrapped {@code expansion}. */
+  private RegularExpression scannedToken(final Expansion expansion) {
+    Expansion seq = expansion;
+    while (true) {
+      if ((seq instanceof Sequence) && (((Sequence) seq).units.size() == 2)) {
+        seq = ((Sequence) seq).units.get(1);
+      } else if (seq instanceof NonTerminal) {
+        final NormalProduction ntprod =
+            context.globals().production_table.get(((NonTerminal) seq).getName());
+        if (ntprod instanceof CodeProduction) {
+          return null;
+        }
+        seq = ntprod.getExpansion();
+      } else {
+        return seq instanceof RegularExpression ? (RegularExpression) seq : null;
+      }
+    }
+  }
+
+  /** The bit sets of the token set choices, and {@code jj_scan_token_set} when there are any. */
+  private void emitTokenSetChoices() {
+    if (tokenSetKinds.isEmpty()) {
+      return;
+    }
+    for (int id = 0; id < tokenSetKinds.size(); id++) {
+      final int[] kinds = tokenSetKinds.get(id);
+      int maxKind = 0;
+      for (final int kind : kinds) {
+        maxKind = Math.max(maxKind, kind);
+      }
+      final long[] bits = new long[(maxKind >>> 6) + 1];
+      for (final int kind : kinds) {
+        bits[kind >>> 6] |= 1L << kind;
+      }
+      final StringBuilder line = new StringBuilder("  private static final long[] jj_token_set_");
+      line.append(id).append(" = {");
+      for (int i = 0; i < bits.length; i++) {
+        line.append(i == 0 ? "" : ", ").append("0x").append(Long.toHexString(bits[i])).append('L');
+      }
+      cb.println(line.append("};").toString());
+      if (Options.getErrorReporting()) {
+        // built in methods rather than in the static initializer, which is limited to 64KB
+        final StringBuilder kindList = new StringBuilder();
+        final StringBuilder locationList = new StringBuilder();
+        final String[] locations = tokenSetLocations.get(id);
+        for (int i = 0; i < kinds.length; i++) {
+          kindList.append(i == 0 ? "" : ", ").append(kinds[i]);
+          locationList.append(i == 0 ? "\"" : ", \"").append(locations[i]).append('"');
+        }
+        final String name = "jj_token_set_" + id;
+        cb.println("  private static final int[] " + name + "_kinds = " + name + "_kinds();");
+        cb.println("  private static final String[] " + name + "_locs = " + name + "_locs();");
+        cb.println("  private static int[] " + name + "_kinds() {");
+        cb.println("    return new int[] {" + kindList + "};");
+        cb.println("  }");
+        cb.println("  private static String[] " + name + "_locs() {");
+        cb.println("    return new String[] {" + locationList + "};");
+        cb.println("  }");
+      }
+    }
+    cb.println();
+    cb.println("  /**");
+    cb.println("   * Scan for a token of one of the kinds in the bit set {@code kinds}, like a");
+    cb.println("   * choice of {@code jj_scan_token} calls but with one lookup.");
+    cb.println("   */");
+    cb.print("  private " + JavaUtil.getStatic() + "boolean jj_scan_token_set(final long[] kinds");
+    if (Options.getErrorReporting()) {
+      cb.print(", final int[] alternativeKinds, final String[] alternativeLocations");
+    }
+    cb.println(") {");
+    if (Options.getErrorReporting()) {
+      cb.println("    if (jj_rescan) {");
+      cb.println("      // report every expected kind, in the order of the alternatives");
+      cb.println("      final " + getTypeForToken() + " xsp = jj_scanpos;");
+      cb.println("      for (int i = 0; i < alternativeKinds.length; i++) {");
+      cb.println("        jj_scanpos = xsp;");
+      cb.println("        if (LA_Scan_Token_Success");
+      cb.println("            == jj_scan_token(alternativeKinds[i], alternativeLocations[i])) {");
+      cb.println("          return LA_Scan_Token_Success;");
+      cb.println("        }");
+      cb.println("      }");
+      cb.println("      return LA_Scan_Token_Failure;");
+      cb.println("    }");
+    }
+    cb.println("    if (jj_scanpos == jj_lastpos) {");
+    cb.println("      jj_la--;");
+    cb.println("      if (jj_scanpos.next == null) {");
+    cb.println("        jj_lastpos = jj_scanpos = jj_scanpos.next = token_source.getNextToken();");
+    cb.println("      } else {");
+    cb.println("        jj_lastpos = jj_scanpos = jj_scanpos.next;");
+    cb.println("      }");
+    cb.println("    } else {");
+    cb.println("      jj_scanpos = jj_scanpos.next;");
+    cb.println("    }");
+    cb.println("    final int kind = jj_scanpos.kind;");
+    cb.println("    if ((kind >>> 6) >= kinds.length");
+    cb.println("        || (kinds[kind >>> 6] & (1L << kind)) == 0L) {");
+    cb.println("      return LA_Scan_Token_Failure;");
+    cb.println("    }");
+    cb.println("    if (jj_la == 0 && jj_scanpos == jj_lastpos) {");
+    cb.println("      throw jj_ls;");
+    cb.println("    }");
+    cb.println("    return LA_Scan_Token_Success;");
+    cb.println("  }");
+    cb.println();
   }
 
   /*
@@ -2751,8 +2904,28 @@ class ParserCodeGenerator implements org.javacc.parser.ParserCodeGenerator {
     } else if (e instanceof Choice) {
       final Choice e_nrw = (Choice) e;
       final int nbChoices = e_nrw.getChoices().size();
+      final List<RegularExpression> tokenAlternatives = singleTokenAlternatives(e_nrw);
 
-      if (nbChoices > CHOICE_CHAIN_THRESHOLD && !recursive_call) {
+      if (tokenAlternatives != null) {
+        // Every alternative scans one token: one bit set lookup replaces a chain of scans
+        final int id = tokenSetKinds.size();
+        final int[] kinds = new int[nbChoices];
+        final String[] locations = new String[nbChoices];
+        for (int i = 0; i < nbChoices; i++) {
+          final Expansion alternative = e_nrw.getChoices().get(i);
+          kinds[i] = tokenAlternatives.get(i).ordinal;
+          locations[i] = alternative.getLine() + ":" + alternative.getColumn();
+        }
+        tokenSetKinds.add(kinds);
+        tokenSetLocations.add(locations);
+        cb.print(ind + "    if (LA_Scan_Token_Failure == jj_scan_token_set(jj_token_set_" + id);
+        if (Options.getErrorReporting()) {
+          cb.print(", jj_token_set_" + id + "_kinds, jj_token_set_" + id + "_locs");
+        }
+        cb.println(")) {");
+        cb.println(ind + "      " + genReturn(true, 0, ind));
+        cb.println(ind + "    }");
+      } else if (nbChoices > CHOICE_CHAIN_THRESHOLD && !recursive_call) {
         // Large Choice: split into continuation sub-methods to avoid 64KB bytecode limit.
         // Each chunk handles up to CHOICE_CHAIN_THRESHOLD alternatives.
         // The last alternative in each chunk (except the final chunk) delegates
